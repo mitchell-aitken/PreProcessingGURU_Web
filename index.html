@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Drone Data Pre‑Processing Web</title>
+  <style>
+    /* Modern UI inspired by your Lap Helper styles */
+    * { box-sizing: border-box; }
+
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700&display=swap');
+
+    body { margin: 0; font-family: Arial, sans-serif; background-color: #f5f5f5; color: #222; }
+
+    h1 { font-family: 'Orbitron', sans-serif; font-size: 36px; font-weight: 700;
+         background: linear-gradient(90deg, #00bcd4, #4caf50, #00bcd4); background-size: 200% auto;
+         color: transparent; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+         display: inline-block; position: relative; transition: background-position 0.5s ease; text-align: center; margin: 10px 0 20px; }
+    h1::after { content: ''; position: absolute; left: 0; bottom: -8px; width: 100%; height: 3px;
+         background: linear-gradient(90deg, #00bcd4, #4caf50, #00bcd4); background-size: 200% auto;
+         transform: scaleX(0); transform-origin: left; transition: transform 0.3s ease; }
+    h1:hover { background-position: right center; }
+    h1:hover::after { transform: scaleX(1); }
+
+    #container { display: flex; height: 100vh; overflow: hidden; }
+    #leftPanel, #rightPanel { padding: 16px; overflow-y: auto; }
+    #leftPanel { flex: 2; background-color: #1e1e1e; color: #fff; display: flex; flex-direction: column; align-items: center; }
+    #rightPanel { flex: 1; background-color: #fff; border-left: 1px solid #ccc; }
+
+    .controls { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 12px 0; }
+    .controls button { font-size: 16px; padding: 10px 16px; border: none; background-color: #4caf50; color: white; border-radius: 6px; cursor: pointer; }
+    .controls button:hover { background-color: #45a049; }
+
+    .inputs { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; width: 100%; justify-content: center; }
+    .inputs input[type="text"] { padding: 8px 10px; border: 1px solid #999; border-radius: 6px; background: #2a2a2a; color: #fff; }
+    .inputs label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+
+    .tag { font-size: 12px; padding: 4px 8px; border-radius: 999px; background: #333; color: #ccc; border: 1px solid #555; }
+
+    #log { white-space: pre-wrap; background: #0b0f1c; color: #dbe6ff; padding: 12px; border-radius: 12px; min-height: 180px; border: 1px solid #24304d; }
+
+    /* Small screens */
+    @media (max-width: 900px) {
+      #container { flex-direction: column; height: auto; }
+      #leftPanel, #rightPanel { flex: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="leftPanel">
+      <h1>Drone Data Pre‑Processing</h1>
+      <div class="inputs">
+        <button id="pick" class="controls-button">Pick Folder</button>
+        <span id="picked" class="tag" hidden>no folder</span>
+      </div>
+      <div class="inputs">
+        <label><input type="checkbox" id="includeUpwind"> Include Upwind Data</label>
+        <label><input type="checkbox" id="allInOne"> All Sites in One Folder</label>
+        <label><input type="checkbox" id="createPpt"> Create PowerPoint</label>
+        <label>Client <input id="clientName" type="text" placeholder="TestFlights" /></label>
+      </div>
+      <div class="controls">
+        <button id="sortByDate" disabled>Sort by Date</button>
+        <button id="process" disabled>Process Data</button>
+      </div>
+    </div>
+
+    <div id="rightPanel">
+      <strong>Log</strong>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    // Environment checks
+    window.addEventListener('DOMContentLoaded', () => {
+      if (!('showDirectoryPicker' in window)) {
+        log('This browser lacks File System Access API. Ask to enable zip fallback.');
+      }
+    });
+    // Regex: accept DYYYYMMDDHHMM just before .txt (allows optional .txt twice)
+    const TIMESTAMP_RE = /(?:^|_)D(20\d{10})(?=\.txt(?:\.txt)?$)/i;
+    const RAW_D_STEM_RE = /^D20\d{10}$/i;
+
+    let rootHandle = null;
+
+    const logEl = document.getElementById('log');
+    function log(s) { logEl.textContent += s + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+
+    document.getElementById('pick').addEventListener('click', async () => {
+      try {
+        if (!('showDirectoryPicker' in window)) {
+          throw new Error('This browser does not support the File System Access API');
+        }
+        rootHandle = await window.showDirectoryPicker();
+        document.getElementById('picked').hidden = false;
+        document.getElementById('picked').textContent = await rootHandle.name;
+        document.getElementById('sortByDate').disabled = false;
+        document.getElementById('process').disabled = false;
+        log('Folder picked: ' + rootHandle.name);
+      } catch (e) {
+        if (e && e.name === 'AbortError') {
+          // User cancelled the picker, do not log as an error
+          return;
+        }
+        log('Error picking folder: ' + (e && (e.name + ': ' + e.message)));
+        const env = document.getElementById('envwarn');
+        if (env && location.protocol !== 'https:' && location.hostname !== 'localhost') {
+          env.style.display = 'block';
+        }
+      }
+    });
+
+    async function* listFiles(dirHandle) {
+      for await (const [name, handle] of dirHandle.entries()) {
+        if (handle.kind === 'file') yield [name, handle];
+      }
+    }
+
+    function extractDstamp(name) {
+      const m = name.match(TIMESTAMP_RE);
+      return m ? m[1] : null; // YYYYMMDDHHMM
+    }
+
+    function isRawD(stem) { return RAW_D_STEM_RE.test(stem); }
+
+    function stemWithoutDoubleTxt(stem) { return stem.toLowerCase().endsWith('.txt') ? stem.slice(0, -4) : stem; }
+
+    async function ensureSubdir(dirHandle, name) {
+      return await dirHandle.getDirectoryHandle(name, { create: true });
+    }
+
+    async function moveFile(srcDir, srcName, dstDir, dstName) {
+      // Copy bytes, then delete original
+      const srcHandle = await srcDir.getFileHandle(srcName);
+      const file = await srcHandle.getFile();
+      const dstHandle = await dstDir.getFileHandle(dstName, { create: true });
+      const writable = await dstHandle.createWritable();
+      await writable.write(await file.arrayBuffer());
+      await writable.close();
+      await srcDir.removeEntry(srcName);
+    }
+
+    document.getElementById('sortByDate').addEventListener('click', async () => {
+      if (!rootHandle) return;
+      try {
+        const pairs = [];
+        for await (const [name, handle] of listFiles(rootHandle)) {
+          if (!name.toLowerCase().endsWith('.txt') && !name.toLowerCase().endsWith('.txt.txt')) continue;
+          const ds = extractDstamp(name);
+          if (ds) pairs.push([name, ds]);
+        }
+        if (pairs.length === 0) { log('No matching files found.'); return; }
+        for (const [name, ds] of pairs) {
+          const y = ds.slice(0, 4), m = ds.slice(4, 6), d = ds.slice(6, 8);
+          const folder = `${y}-${m}-${d}`;
+          const sub = await ensureSubdir(rootHandle, folder);
+          await moveFile(rootHandle, name, sub, name);
+          log(`Moved ${name} to ${folder}/`);
+        }
+        log('Files sorted successfully.');
+      } catch (e) {
+        log('Error in sort: ' + e.message);
+      }
+    });
+
+    function plausibleLatLon(lat, lon) {
+      return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+    }
+
+    async function readText(fileHandle) {
+      const file = await fileHandle.getFile();
+      return await file.text();
+    }
+
+    function parseLatLonFromCSV(csvText) {
+      // Files have 4 metadata lines, then a header line, then data rows.
+      // So the first data row is AFTER the header at index 4.
+      const lines = csvText.split(/\r?\n/);
+      const headerIdx = 4; // 0-based: line 5 is the CSV header
+      if (lines.length <= headerIdx) return null;
+
+      // Start at the row after the header, skip blank lines
+      let start = headerIdx + 1;
+      while (start < lines.length && !lines[start].trim()) start++;
+      if (start >= lines.length) return null;
+
+      const first = lines[start];
+      // Simple CSV split. These columns are plain integers.
+      const cols = first.split(',');
+      if (cols.length < 3) return null;
+
+      const latStr = String(cols[1]).trim();
+      const lonStr = String(cols[2]).trim();
+      // Must be integers in micro-degrees like 299361547 and -955319605
+      if (!/^[-+]?\d+$/.test(latStr) || !/^[-+]?\d+$/.test(lonStr)) return null;
+
+      const lat = Number(latStr.slice(0, -7) + '.' + latStr.slice(-7));
+      const lon = Number(lonStr.slice(0, -7) + '.' + lonStr.slice(-7));
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+      return { lat, lon };
+    }
+
+    function getSiteName(fileName, headerLines) {
+      // Header rules provided by the user
+      const stemRaw = fileName.replace(/\.(?:txt)(?:\.txt)?$/i, '');
+      const stem = stemWithoutDoubleTxt(stemRaw);
+      const rawD = isRawD(stem);
+      let site = '';
+      if (headerLines.length >= 5) {
+        if (rawD) site = headerLines[2].trim(); else site = headerLines[1].trim();
+      }
+      if (!site) {
+        const idx = stem.lastIndexOf('_D');
+        site = idx >= 0 ? stem.slice(0, idx) : stem;
+      }
+      return site;
+    }
+
+    function buildSiteDetailPy(template) {
+      // template: { sites:[ [lat,lon], ...], labels:[..], radius:[..], siteplot:[..], bins:[..], method:[..] }
+      const lines = [];
+      for (const [key, arr] of Object.entries(template)) {
+        if (Array.isArray(arr)) {
+          const body = arr.map(v => Array.isArray(v) ? `(${v[0]}, ${v[1]})` : String(v)).join(',\n    ');
+          lines.push(`${key} = [\n    ${body}\n]\n`);
+        } else {
+          lines.push(`${key} = ${String(arr)}\n`);
+        }
+      }
+      lines.push('all_times = radius\n');
+      return lines.join('\n');
+    }
+
+    async function writeTextFile(dirHandle, name, text) {
+      const fh = await dirHandle.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(text);
+      await w.close();
+    }
+
+    document.getElementById('process').addEventListener('click', async () => {
+      if (!rootHandle) return;
+      const includeUp = document.getElementById('includeUpwind').checked;
+      const allInOne = document.getElementById('allInOne').checked;
+
+      try {
+        // Collect files with a valid D timestamp
+        const files = [];
+        for await (const [name, handle] of listFiles(rootHandle)) {
+          if (!name.toLowerCase().endsWith('.txt') && !name.toLowerCase().endsWith('.txt.txt')) continue;
+          const ds = extractDstamp(name);
+          if (ds) files.push([name, handle, ds]);
+        }
+        files.sort((a, b) => a[2].localeCompare(b[2]));
+        log('Found and sorted files: ' + files.map(f => f[0]).join(', '));
+
+        const siteNames = [];
+        const combinedDir = allInOne ? await ensureSubdir(rootHandle, 'Combined_Sites') : null;
+        const templateCombined = { sites: [], labels: [], radius: [], siteplot: [], bins: [], method: [] };
+
+        for (const [name, handle] of files) {
+          log('Processing file: ' + name);
+          const text = await readText(handle);
+          const lines = text.split(/\r?\n/);
+          if (lines.length < 5) { log(`Skipping ${name}: not enough header lines`); continue; }
+
+          const site = getSiteName(name, lines);
+          siteNames.push(site);
+
+          const latlon = parseLatLonFromCSV(text);
+          if (!latlon) { log(`Skipping ${name}: could not parse a valid lat/lon`); continue; }
+          log(`Parsed latitude: ${latlon.lat}, parsed longitude: ${latlon.lon}`);
+
+          if (allInOne) {
+            if (includeUp) {
+              templateCombined.sites.push([latlon.lat, latlon.lon], [latlon.lat, latlon.lon]);
+              templateCombined.labels.push(`'${site} dw'`, `'${site} uw'`);
+              templateCombined.radius.push(1300, 1300);
+              templateCombined.siteplot.push(1, 1);
+              templateCombined.bins.push(5, 5);
+              templateCombined.method.push(1, 1);
+            } else {
+              templateCombined.sites.push([latlon.lat, latlon.lon]);
+              templateCombined.labels.push(`'${site}'`);
+              templateCombined.radius.push(1300);
+              templateCombined.siteplot.push(1);
+              templateCombined.bins.push(5);
+              templateCombined.method.push(1);
+            }
+            await moveFile(rootHandle, name, combinedDir, name);
+            log(`Moved ${name} to Combined_Sites/`);
+          } else {
+            // Per site directory
+            const siteDir = await ensureSubdir(rootHandle, site);
+            // Write sitedetail.py for this site
+            const template = includeUp
+              ? { sites: [[latlon.lat, latlon.lon], [latlon.lat, latlon.lon]], labels: [`'${site} dw'`, `'${site} uw'`], radius: [1300, 1300], siteplot: [1, 1], bins: [5, 5], method: [1, 1] }
+              : { sites: [[latlon.lat, latlon.lon]], labels: [`'${site}'`], radius: [1300], siteplot: [1], bins: [5], method: [1] };
+            await writeTextFile(siteDir, 'sitedetail.py', buildSiteDetailPy(template));
+            await moveFile(rootHandle, name, siteDir, name);
+            log(`Moved ${name} to ${site}/`);
+          }
+        }
+
+        if (allInOne && templateCombined.sites.length > 0) {
+          await writeTextFile(combinedDir, 'sitedetail.py', buildSiteDetailPy(templateCombined));
+          log('Updated template file exported to Combined_Sites/sitedetail.py');
+        }
+
+        if (document.getElementById('createPpt').checked) {
+        try {
+          await createPowerPoint(siteNames);
+          log('PowerPoint created.');
+        } catch (e) {
+          log('Failed to create PowerPoint: ' + e.message);
+        }
+      }
+      log('Done.');
+      } catch (e) {
+        log('Error in processing: ' + e.message);
+      }
+    });
+      async function getPptxCtor() {
+      if (window.PptxGenJS) return window.PptxGenJS;
+      const loadScript = (src) => new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src; s.async = true; s.onload = resolve; s.onerror = () => reject(new Error('load failed: ' + src));
+        document.head.appendChild(s);
+      });
+      const tries = [
+        './pptxgen.bundle.min.js',
+        './pptxgen.min.js',
+        'https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.min.js',
+        'https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.min.js',
+        'https://unpkg.com/pptxgenjs@3.12.0/dist/pptxgen.bundle.min.js',
+        'https://unpkg.com/pptxgenjs@3.12.0/dist/pptxgen.min.js'
+      ];
+      for (const src of tries) {
+        try { await loadScript(src); if (window.PptxGenJS) return window.PptxGenJS; } catch (_) {}
+      }
+      throw new Error('PptxGenJS still not available');
+    }
+    async function createPowerPoint(siteNames) {
+      const uniq = Array.from(new Set(siteNames.filter(Boolean)));
+      if (uniq.length === 0) { log('No site names to include in PPT.'); return; }
+      const Pptx = await getPptxCtor();
+      const pptx = new Pptx();
+      // Define a 16:9 custom layout to avoid UNKNOWN-LAYOUT errors across builds
+      pptx.defineLayout({ name: 'WIDESCREEN', width: 13.33, height: 7.5 });
+      pptx.layout = 'WIDESCREEN';
+      // Title slide
+      const folderName = await rootHandle.name;
+      const client = (document.getElementById('clientName')?.value || '').trim();
+      const titleText = client ? `Drone Data: ${client}` : 'Drone Data';
+      let s0 = pptx.addSlide();
+      s0.addText(titleText, { x:0.5, y:1.4, w:9, h:1, fontSize:40, bold:true });
+      s0.addText(folderName, { x:0.5, y:2.2, w:9, h:0.6, fontSize:18 });
+      // Per-site slides
+      for (const site of uniq) {
+        const s = pptx.addSlide();
+        s.addText('site:', { x:0.5, y:0.6, w:1.5, h:0.6, fontSize:22, color:'666666' });
+        s.addText(site, { x:1.2, y:0.6, w:8, h:0.6, fontSize:28, bold:true });
+      }
+      const blob = await pptx.write('blob');
+      const fileName = `PPT_${folderName}.pptx`;
+      const fh = await rootHandle.getFileHandle(fileName, { create: true });
+      const w = await fh.createWritable();
+      await w.write(blob);
+      await w.close();
+    }
+  </script>
+</body>
+</html>
+</html>

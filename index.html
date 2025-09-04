@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Drone Data Pre‑Processing Web</title>
+  <title>Drone Data Pre-Processing Web</title>
   <style>
     /* Modern UI inspired by your Lap Helper styles */
     * { box-sizing: border-box; }
@@ -49,7 +49,7 @@
 <body>
   <div id="container">
     <div id="leftPanel">
-      <h1>Drone Data Pre‑Processing</h1>
+      <h1>Drone Data Pre-Processing</h1>
       <div class="inputs">
         <button id="pick" class="controls-button">Pick Folder</button>
         <span id="picked" class="tag" hidden>no folder</span>
@@ -79,6 +79,7 @@
         log('This browser lacks File System Access API. Ask to enable zip fallback.');
       }
     });
+
     // Regex: accept DYYYYMMDDHHMM just before .txt (allows optional .txt twice)
     const TIMESTAMP_RE = /(?:^|_)D(20\d{10})(?=\.txt(?:\.txt)?$)/i;
     const RAW_D_STEM_RE = /^D20\d{10}$/i;
@@ -100,10 +101,7 @@
         document.getElementById('process').disabled = false;
         log('Folder picked: ' + rootHandle.name);
       } catch (e) {
-        if (e && e.name === 'AbortError') {
-          // User cancelled the picker, do not log as an error
-          return;
-        }
+        if (e && e.name === 'AbortError') return;
         log('Error picking folder: ' + (e && (e.name + ': ' + e.message)));
         const env = document.getElementById('envwarn');
         if (env && location.protocol !== 'https:' && location.hostname !== 'localhost') {
@@ -132,7 +130,6 @@
     }
 
     async function moveFile(srcDir, srcName, dstDir, dstName) {
-      // Copy bytes, then delete original
       const srcHandle = await srcDir.getFileHandle(srcName);
       const file = await srcHandle.getFile();
       const dstHandle = await dstDir.getFileHandle(dstName, { create: true });
@@ -165,6 +162,80 @@
       }
     });
 
+    function parseNumberSmart(s) {
+      const n = Number(String(s).trim());
+      if (!Number.isFinite(n)) return null;
+      return n;
+    }
+
+    function normalizeLatLon(latRaw, lonRaw) {
+      let lat = parseNumberSmart(latRaw);
+      let lon = parseNumberSmart(lonRaw);
+      if (lat === null || lon === null) return null;
+
+      // Convert micro degrees if needed
+      if (Math.abs(lat) >= 1e6 || Math.abs(lon) >= 1e6) {
+        lat = lat / 1e7;
+        lon = lon / 1e7;
+      }
+
+      if (lat === 0 && lon === 0) return null;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+      return { lat, lon };
+    }
+
+    function looksLikeIdString(s) {
+      return /^[A-Z0-9_-]{8,}$/.test(String(s).trim());
+    }
+
+    function findHeaderIndexByCount(lines) {
+      // First non-empty line as integer count of metadata lines
+      for (let i = 0; i < Math.min(lines.length, 3); i++) {
+        const t = lines[i]?.trim();
+        if (!t) continue;
+        if (/^\d+$/.test(t)) {
+          const n = parseInt(t, 10);
+          if (n >= 0 && n < 100) return n; // sane bounds
+        }
+        // If first non-empty is not an integer, bail to token search
+        break;
+      }
+      return null;
+    }
+
+    function findHeaderIndexByTokens(lines) {
+      const mustHave = ["D_time_orig","D_lat","D_lon"];
+      for (let i = 0; i < Math.min(lines.length, 50); i++) {
+        const L = lines[i]?.trim();
+        if (!L || L.startsWith("#")) continue;
+        if (L.includes(",") && mustHave.every(t => L.includes(t))) return i;
+      }
+      return null;
+    }
+
+    function findHeaderIndex(lines) {
+      const byCount = findHeaderIndexByCount(lines);
+      if (byCount !== null) return byCount;
+      const byTokens = findHeaderIndexByTokens(lines);
+      if (byTokens !== null) return byTokens;
+      // Final fallback for legacy files
+      return 4;
+    }
+
+    function inferSiteFromMetadata(metaLines, stem) {
+      const candidates = [];
+      for (const t0 of metaLines.slice(0, 6)) {
+        const t = String(t0 ?? '').trim();
+        if (!t) continue;
+        if (/^\d+$/.test(t)) continue;          // skip a lone count
+        if (looksLikeIdString(t)) continue;     // skip likely IDs
+        candidates.push(t);
+      }
+      if (candidates.length) return candidates[0];
+      const idx = stem.lastIndexOf("_D");
+      return idx >= 0 ? stem.slice(0, idx) : stem;
+    }
+
     function plausibleLatLon(lat, lon) {
       return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
     }
@@ -175,48 +246,34 @@
     }
 
     function parseLatLonFromCSV(csvText) {
-      // Files have 4 metadata lines, then a header line, then data rows.
-      // So the first data row is AFTER the header at index 4.
       const lines = csvText.split(/\r?\n/);
-      const headerIdx = 4; // 0-based: line 5 is the CSV header
-      if (lines.length <= headerIdx) return null;
+      const headerIdx = findHeaderIndex(lines);
+      if (headerIdx >= lines.length) return null;
 
-      // Start at the row after the header, skip blank lines
-      let start = headerIdx + 1;
-      while (start < lines.length && !lines[start].trim()) start++;
-      if (start >= lines.length) return null;
+      const header = lines[headerIdx].split(",");
+      const latCol = header.findIndex(h => h.trim() === "D_lat");
+      const lonCol = header.findIndex(h => h.trim() === "D_lon");
+      if (latCol < 0 || lonCol < 0) return null;
 
-      const first = lines[start];
-      // Simple CSV split. These columns are plain integers.
-      const cols = first.split(',');
-      if (cols.length < 3) return null;
-
-      const latStr = String(cols[1]).trim();
-      const lonStr = String(cols[2]).trim();
-      // Must be integers in micro-degrees like 299361547 and -955319605
-      if (!/^[-+]?\d+$/.test(latStr) || !/^[-+]?\d+$/.test(lonStr)) return null;
-
-      const lat = Number(latStr.slice(0, -7) + '.' + latStr.slice(-7));
-      const lon = Number(lonStr.slice(0, -7) + '.' + lonStr.slice(-7));
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
-      return { lat, lon };
+      for (let i = headerIdx + 1; i < lines.length; i++) {
+        const row = lines[i];
+        if (!row || !row.trim()) continue;
+        const cols = row.split(",");
+        if (cols.length <= Math.max(latCol, lonCol)) continue;
+        const pair = normalizeLatLon(cols[latCol], cols[lonCol]);
+        if (pair) return pair;
+      }
+      return null;
     }
 
-    function getSiteName(fileName, headerLines) {
-      // Header rules provided by the user
-      const stemRaw = fileName.replace(/\.(?:txt)(?:\.txt)?$/i, '');
+    function getSiteName(fileName, allLines) {
+      const stemRaw = fileName.replace(/\.(?:txt)(?:\.txt)?$/i, "");
       const stem = stemWithoutDoubleTxt(stemRaw);
-      const rawD = isRawD(stem);
-      let site = '';
-      if (headerLines.length >= 5) {
-        if (rawD) site = headerLines[2].trim(); else site = headerLines[1].trim();
-      }
-      if (!site) {
-        const idx = stem.lastIndexOf('_D');
-        site = idx >= 0 ? stem.slice(0, idx) : stem;
-      }
-      return site;
+
+      const headerIdx = findHeaderIndex(allLines);
+      const metaSlice = allLines.slice(0, Math.max(0, headerIdx));
+      const site = inferSiteFromMetadata(metaSlice, stem);
+      return site || stem;
     }
 
     function buildSiteDetailPy(template) {
@@ -265,7 +322,7 @@
           log('Processing file: ' + name);
           const text = await readText(handle);
           const lines = text.split(/\r?\n/);
-          if (lines.length < 5) { log(`Skipping ${name}: not enough header lines`); continue; }
+          if (lines.length < 2) { log(`Skipping ${name}: not enough lines`); continue; }
 
           const site = getSiteName(name, lines);
           siteNames.push(site);
@@ -311,19 +368,20 @@
         }
 
         if (document.getElementById('createPpt').checked) {
-        try {
-          await createPowerPoint(siteNames);
-          log('PowerPoint created.');
-        } catch (e) {
-          log('Failed to create PowerPoint: ' + e.message);
+          try {
+            await createPowerPoint(siteNames);
+            log('PowerPoint created.');
+          } catch (e) {
+            log('Failed to create PowerPoint: ' + e.message);
+          }
         }
-      }
-      log('Done.');
+        log('Done.');
       } catch (e) {
         log('Error in processing: ' + e.message);
       }
     });
-      async function getPptxCtor() {
+
+    async function getPptxCtor() {
       if (window.PptxGenJS) return window.PptxGenJS;
       const loadScript = (src) => new Promise((resolve, reject) => {
         const s = document.createElement('script');
@@ -343,27 +401,28 @@
       }
       throw new Error('PptxGenJS still not available');
     }
+
     async function createPowerPoint(siteNames) {
       const uniq = Array.from(new Set(siteNames.filter(Boolean)));
       if (uniq.length === 0) { log('No site names to include in PPT.'); return; }
       const Pptx = await getPptxCtor();
       const pptx = new Pptx();
-      // Define a 16:9 custom layout to avoid UNKNOWN-LAYOUT errors across builds
       pptx.defineLayout({ name: 'WIDESCREEN', width: 13.33, height: 7.5 });
       pptx.layout = 'WIDESCREEN';
-      // Title slide
       const folderName = await rootHandle.name;
       const client = (document.getElementById('clientName')?.value || '').trim();
       const titleText = client ? `Drone Data: ${client}` : 'Drone Data';
+
       let s0 = pptx.addSlide();
       s0.addText(titleText, { x:0.5, y:1.4, w:9, h:1, fontSize:40, bold:true });
       s0.addText(folderName, { x:0.5, y:2.2, w:9, h:0.6, fontSize:18 });
-      // Per-site slides
+
       for (const site of uniq) {
         const s = pptx.addSlide();
         s.addText('site:', { x:0.5, y:0.6, w:1.5, h:0.6, fontSize:22, color:'666666' });
         s.addText(site, { x:1.2, y:0.6, w:8, h:0.6, fontSize:28, bold:true });
       }
+
       const blob = await pptx.write('blob');
       const fileName = `PPT_${folderName}.pptx`;
       const fh = await rootHandle.getFileHandle(fileName, { create: true });
@@ -373,5 +432,4 @@
     }
   </script>
 </body>
-</html>
 </html>

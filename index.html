@@ -188,7 +188,7 @@
       return /^[A-Z0-9_-]{8,}$/.test(String(s).trim());
     }
 
-    // ---------- New robust header detection [supports up to 7 metadata lines] ----------
+    // ---------- Robust header detection [supports up to 7 metadata lines] ----------
     function rowLooksLikeHeader(line) {
       if (!line || !line.includes(",")) return false;
       const mustHave = ["D_time_orig","D_lat","D_lon"];
@@ -251,19 +251,98 @@
     }
     // ----------------------------------------------------------------------
 
-    function inferSiteFromMetadata(metaLines, stem) {
-      const candidates = [];
-      for (const t0 of metaLines.slice(0, 6)) {
-        const t = String(t0 ?? '').trim();
-        if (!t) continue;
-        if (/^\d+$/.test(t)) continue;          // skip a lone count
-        if (looksLikeIdString(t)) continue;     // skip likely IDs
-        candidates.push(t);
-      }
-      if (candidates.length) return candidates[0];
-      const idx = stem.lastIndexOf("_D");
-      return idx >= 0 ? stem.slice(0, idx) : stem;
+    // --------- Smarter site name inference with exclusions and scoring ---------
+    const SITE_EXCLUDE_PATTERNS = [
+      /\bmatrice\b/i,
+      /\bdji\b/i,
+      /\brtk\b/i,
+      /\bm3(?:00|10|30|50|40)\b/i,
+      /\bm2(?:00)\b/i,
+      /\bopls\b/i,
+      // common org codes or vendor tags
+      /\bSLB\b/i,
+      /\bOXY(?:\d+)?\b/i
+    ];
+    const EXCLUDED_EXACT = new Set(["SLB","OXY","DJI","RTK"]);
+
+    function isAllCaps(s) { return /^[A-Z]+$/.test(s); }
+
+    // Looks like an equipment or database style ID
+    function looksLikePureId(s) {
+      const t = String(s || '').trim();
+      if (!t) return false;
+      if (t.includes(' ')) return false;
+      return /^[A-Z0-9_-]{4,}$/.test(t);
     }
+
+    function isExcludedCandidate(s) {
+      const t = String(s || '').trim();
+      if (!t) return true;
+      if (/^\d+$/.test(t)) return true;                 // lone count like "5"
+      if (EXCLUDED_EXACT.has(t)) return true;           // exact short vendor/org
+      if (looksLikePureId(t)) return true;              // OXY001, 4LGZ..., etc.
+      return SITE_EXCLUDE_PATTERNS.some(rx => rx.test(t));
+    }
+
+    // Score with position awareness; reward mixed-case, early lines, light digits
+    function scoreCandidate(s, idx) {
+      const t = String(s || '').trim();
+      if (!t) return -Infinity;
+      if (isExcludedCandidate(t)) return -Infinity;
+
+      let score = 0;
+
+      if (t.includes(' ')) score += 3;                  // human names often have spaces
+      if (!/\d/.test(t)) score += 1;                    // fewer digits looks more like a name
+      else if ((t.match(/\d/g) || []).length <= 2) score += 1; // allow modest digits like "Test7"
+      if (t.length >= 6) score += 1;
+
+      // penalize short all-caps tokens like "SLB"
+      if (isAllCaps(t) && t.length <= 4) score -= 2;
+
+      // light boost for site-ish words
+      if (/\b(downwind|upwind|pad|lease|plant|station|facility|hot|springs|well|mpfm)\b/i.test(t)) score += 1;
+
+      // position bonus: earlier meta lines are more likely to be the intended label
+      const posBonus = Math.max(0, 5 - (idx ?? 9));
+      score += posBonus;
+
+      return score;
+    }
+
+    function inferSiteFromMetadata(metaLines, stem) {
+      const clean = s => String(s || '').replace(/[.\s]+$/g, '').trim();
+
+      // Build candidate pool with indices
+      const pool = metaLines.slice(0, 12)
+        .map((v, i) => ({ text: clean(v), idx: i }))
+        .filter(x => x.text);
+
+      // Fast path: first non-excluded and not short all-caps token
+      const firstGood = pool.find(x => !isExcludedCandidate(x.text) && !(isAllCaps(x.text) && x.text.length <= 4));
+      if (firstGood) return firstGood.text;
+
+      // Otherwise, score all candidates
+      let best = null;
+      let bestScore = -Infinity;
+      for (const cand of pool) {
+        const sc = scoreCandidate(cand.text, cand.idx);
+        if (sc > bestScore) {
+          bestScore = sc;
+          best = cand.text;
+        }
+      }
+      if (best && bestScore > -Infinity) return best;
+
+      // Fallbacks
+      const withSpaces = pool.find(x => x.text.includes(' ') && !isExcludedCandidate(x.text));
+      if (withSpaces) return withSpaces.text;
+
+      const idx = stem.lastIndexOf("_D");
+      const byStem = idx >= 0 ? stem.slice(0, idx) : stem;
+      return clean(byStem);
+    }
+    // --------------------------------------------------------------------------
 
     function plausibleLatLon(lat, lon) {
       return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;

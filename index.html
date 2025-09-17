@@ -261,18 +261,33 @@
       /\bopls\b/i,
       // common org codes or vendor tags
       /\bSLB\b/i,
-      /\bOXY(?:\d+)?\b/i
+      /\bOXY(?:\d+)?\b/i,
+      // /\bSHELL\b/i,
+      // /\bCHEVRON\b/i,
+      // /\bJonah\b/i
     ];
-    const EXCLUDED_EXACT = new Set(["SLB","OXY","DJI","RTK"]);
+    const EXCLUDED_EXACT = new Set(["SLB","OXY","DJI","RTK","JONAH", "CHEVRON", "COPAK", "CDPHE"]);
 
     function isAllCaps(s) { return /^[A-Z]+$/.test(s); }
 
-    // Looks like an equipment or database style ID
+    // New: allow short lowercase labels like "ggt2" and treat long or uppercase alnum as IDs
     function looksLikePureId(s) {
       const t = String(s || '').trim();
       if (!t) return false;
       if (t.includes(' ')) return false;
-      return /^[A-Z0-9_-]{4,}$/.test(t);
+
+      // Allow short lowercase tokens that look like human labels: ggt2, pad7, test9
+      if (/^[a-z][a-z0-9]{2,6}$/.test(t) && ((t.match(/\d/g) || []).length <= 2)) {
+        return false; // treat as a valid site label, not an ID
+      }
+
+      // Known ID-ish patterns or long opaque strings
+      if (/^(?:OXY\d+|SLB\d*|ShellNAM\d+|[A-Z]{2,}\d{2,}|[0-9A-Z_-]{8,})$/.test(t)) return true;
+
+      // Mixed-case with trailing digits and length >= 6 tends to be inventory IDs
+      if (/^[A-Za-z]+\d{2,}$/.test(t) && t.length >= 6) return true;
+
+      return false;
     }
 
     function isExcludedCandidate(s) {
@@ -280,7 +295,7 @@
       if (!t) return true;
       if (/^\d+$/.test(t)) return true;                 // lone count like "5"
       if (EXCLUDED_EXACT.has(t)) return true;           // exact short vendor/org
-      if (looksLikePureId(t)) return true;              // OXY001, 4LGZ..., etc.
+      if (looksLikePureId(t)) return true;              // OXY001, ShellNAM001, 4LGZ..., etc.
       return SITE_EXCLUDE_PATTERNS.some(rx => rx.test(t));
     }
 
@@ -294,8 +309,11 @@
 
       if (t.includes(' ')) score += 3;                  // human names often have spaces
       if (!/\d/.test(t)) score += 1;                    // fewer digits looks more like a name
-      else if ((t.match(/\d/g) || []).length <= 2) score += 1; // allow modest digits like "Test7"
-      if (t.length >= 6) score += 1;
+      else if ((t.match(/\d/g) || []).length <= 2) score += 1; // allow modest digits like "Test7" or "ggt2"
+      if (t.length >= 4) score += 1;
+
+      // small boost for short lowercase labels
+      if (/^[a-z][a-z0-9]{2,6}$/.test(t)) score += 2;
 
       // penalize short all-caps tokens like "SLB"
       if (isAllCaps(t) && t.length <= 4) score -= 2;
